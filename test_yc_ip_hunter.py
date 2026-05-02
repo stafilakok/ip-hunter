@@ -230,6 +230,8 @@ class IterationTests(unittest.TestCase):
         text = MODULE_PATH.read_text(encoding="utf-8")
         self.assertIn("address_delete_retries", text)
         self.assertIn("pre_cloud_delete_cleanup_sleep_seconds", text)
+        self.assertIn("deep_cleanup_before_cloud_delete", text)
+        self.assertIn("COMPUTE_URL", text)
 
     def test_telegram_notification_setting_exists(self):
         text = MODULE_PATH.read_text(encoding="utf-8")
@@ -324,6 +326,57 @@ class StateTrackingTests(unittest.TestCase):
         hunter.cleanup_cloud_addresses("cloud-1")
 
         self.assertEqual(hunter.client.deleted, [("addr-1", False)])
+
+    def test_deep_cleanup_lists_folder_resources_before_cloud_delete(self):
+        class FakeClient:
+            def __init__(self):
+                self.deleted_addresses = []
+                self.deleted_resources = []
+
+            def delete_address(self, address_id, wait=True):
+                self.deleted_addresses.append((address_id, wait))
+
+            def list_folders(self, cloud_id):
+                self.cloud_id = cloud_id
+                return [{"id": "folder-1"}]
+
+            def list_collection(self, base_url, collection_name, folder_id):
+                if collection_name in {"instances", "networks"}:
+                    return [{"id": f"{collection_name}-1"}]
+                return []
+
+            def delete_resource(self, base_url, resource_id, operation_hint, wait=False):
+                self.deleted_resources.append((resource_id, operation_hint, wait))
+
+        hunter = object.__new__(yc.IpHunter)
+        hunter.state = {
+            "addresses_by_cloud": {
+                "cloud-1": [{"address_id": "addr-1", "delete_submitted": False}]
+            }
+        }
+        hunter.config = {
+            "deep_cleanup_before_cloud_delete": True,
+            "address_delete_retries": 1,
+            "address_delete_retry_sleep_seconds": 0,
+            "pre_cloud_delete_cleanup_sleep_seconds": 0,
+            "deep_cleanup_settle_seconds": 0,
+        }
+        hunter.client = FakeClient()
+        hunter.dry_run = False
+        hunter.persist_state = lambda: None
+        hunter.sleep_backoff = lambda seconds: None
+
+        hunter.cleanup_cloud_before_delete("cloud-1")
+
+        self.assertEqual(hunter.client.cloud_id, "cloud-1")
+        self.assertEqual(hunter.client.deleted_addresses, [("addr-1", False)])
+        self.assertEqual(
+            hunter.client.deleted_resources,
+            [
+                ("instances-1", "delete-instance", False),
+                ("networks-1", "delete-network", False),
+            ],
+        )
 
     def test_address_rate_limit_raises_rate_limit_hit(self):
         class FakeClient:

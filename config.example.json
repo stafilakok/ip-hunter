@@ -41,6 +41,8 @@
   "address_delete_retries": 3,
   "address_delete_retry_sleep_seconds": 2,
   "pre_cloud_delete_cleanup_sleep_seconds": 3,
+  "deep_cleanup_before_cloud_delete": true,
+  "deep_cleanup_settle_seconds": 2,
   "max_parallel_clouds": 3,
   "cloud_iteration_sleep_seconds": 45,
   "cloud_quota_wait_seconds": 120,
