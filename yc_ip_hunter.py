@@ -19,6 +19,7 @@ import os
 import random
 import re
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -34,7 +35,7 @@ RESOURCE_MANAGER_URL = "https://resource-manager.api.cloud.yandex.net/resource-m
 BILLING_URL = "https://billing.api.cloud.yandex.net/billing/v1"
 VPC_URL = "https://vpc.api.cloud.yandex.net/vpc/v1"
 IMMEDIATE_DELETE_AFTER = "1970-01-01T00:00:00Z"
-SUCCESS_VIDEO_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+SUCCESS_VIDEO_URL = "https://www.youtube.com/watch?v=tiCIjTNARX8&list=PLCZl9PrJVBkSJGJi3zpDkbxy8X-BeUQvK"
 
 DEFAULT_TARGET_CIDRS = [
     "84.201.0.0/16",
@@ -186,6 +187,79 @@ def config_bool(value: Any, default: bool = False) -> bool:
         if lowered in {"0", "false", "no", "n", "off"}:
             return False
     return bool(value)
+
+
+def youtube_video_parts(url: str) -> Tuple[str, str]:
+    parsed = urllib.parse.urlparse(url)
+    query = urllib.parse.parse_qs(parsed.query)
+    video_id = str((query.get("v") or [""])[0])
+    playlist_id = str((query.get("list") or [""])[0])
+    if not video_id and parsed.netloc.lower().endswith("youtu.be"):
+        video_id = parsed.path.strip("/").split("/")[0]
+    return video_id, playlist_id
+
+
+def build_success_video_launcher(url: str) -> str:
+    video_id, playlist_id = youtube_video_parts(url)
+    if not video_id:
+        return url
+
+    html = f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>ip hunter</title>
+  <style>
+    html, body, #player {{
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      background: #000;
+      overflow: hidden;
+    }}
+  </style>
+</head>
+<body>
+  <div id="player"></div>
+  <script src="https://www.youtube.com/iframe_api"></script>
+  <script>
+    const videoId = {json.dumps(video_id)};
+    const listId = {json.dumps(playlist_id)};
+    let player;
+
+    function onYouTubeIframeAPIReady() {{
+      const playerVars = {{
+        autoplay: 1,
+        controls: 1,
+        rel: 0,
+        playsinline: 1,
+        origin: window.location.origin
+      }};
+      if (listId) {{
+        playerVars.listType = "playlist";
+        playerVars.list = listId;
+      }}
+      player = new YT.Player("player", {{
+        width: "100%",
+        height: "100%",
+        videoId,
+        playerVars,
+        events: {{
+          onReady: function(event) {{
+            event.target.unMute();
+            event.target.setVolume(100);
+            event.target.playVideo();
+          }}
+        }}
+      }});
+    }}
+  </script>
+</body>
+</html>
+"""
+    path = Path(tempfile.gettempdir()) / "yc-ip-hunter-success.html"
+    path.write_text(html, encoding="utf-8")
+    return path.as_uri()
 
 
 def build_jwt_from_service_account_key(key_path: Path) -> str:
@@ -1350,7 +1424,8 @@ class IpHunter:
         if not url:
             return False
         try:
-            opened = bool(webbrowser.open(url, new=2, autoraise=True))
+            launch_url = build_success_video_launcher(url)
+            opened = bool(webbrowser.open(launch_url, new=2, autoraise=True))
         except Exception as exc:
             LOGGER.debug("Success video failed to open: %s", exc)
             return False

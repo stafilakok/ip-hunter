@@ -2,6 +2,8 @@ import importlib.util
 import ipaddress
 import sys
 import unittest
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 
@@ -375,7 +377,18 @@ class StateTrackingTests(unittest.TestCase):
         finally:
             yc.webbrowser.open = original_open
 
-        self.assertEqual(opened, [(yc.SUCCESS_VIDEO_URL, 2, True)])
+        self.assertEqual(len(opened), 1)
+        self.assertEqual(opened[0][1:], (2, True))
+        self.assertTrue(opened[0][0].startswith("file:///"))
+
+    def test_success_video_launcher_sets_youtube_volume(self):
+        launch_url = yc.build_success_video_launcher(yc.SUCCESS_VIDEO_URL)
+        self.assertTrue(launch_url.startswith("file:///"))
+        parsed = urllib.parse.urlparse(launch_url)
+        html = Path(urllib.request.url2pathname(parsed.path)).read_text(encoding="utf-8")
+        self.assertIn("tiCIjTNARX8", html)
+        self.assertIn("PLCZl9PrJVBkSJGJi3zpDkbxy8X-BeUQvK", html)
+        self.assertIn("setVolume(100)", html)
 
     def test_telegram_enabled_inside_disabled_parent_still_sends(self):
         hunter = object.__new__(yc.IpHunter)
