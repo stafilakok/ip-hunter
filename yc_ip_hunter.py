@@ -172,6 +172,20 @@ def setup_logging(log_file: Optional[Path], verbose: bool) -> None:
         LOGGER.addHandler(file_handler)
 
 
+def config_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "y", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "n", "off"}:
+            return False
+    return bool(value)
+
+
 def build_jwt_from_service_account_key(key_path: Path) -> str:
     try:
         import jwt  # type: ignore
@@ -1328,13 +1342,26 @@ class IpHunter:
 
     def notify_success(self, result: AttemptResult) -> None:
         notifications = self.config.get("notifications") or {}
-        if not isinstance(notifications, dict) or not bool(notifications.get("enabled", False)):
+        if not isinstance(notifications, dict):
             return
 
         telegram = notifications.get("telegram") or {}
-        if not isinstance(telegram, dict) or not bool(telegram.get("enabled", False)):
+        if not isinstance(telegram, dict):
             return
 
+        notifications_enabled = config_bool(notifications.get("enabled"), default=False)
+        telegram_enabled = config_bool(
+            telegram.get("enabled"),
+            default=notifications_enabled,
+        )
+        if not telegram_enabled:
+            return
+
+        self.send_telegram_notification(result)
+
+    def send_telegram_notification(self, result: AttemptResult) -> bool:
+        notifications = self.config.get("notifications") or {}
+        telegram = notifications.get("telegram") or {}
         chat_id = str(telegram.get("chat_id") or "").strip()
         token = str(telegram.get("bot_token") or "").strip()
         token_env = str(telegram.get("bot_token_env") or "TELEGRAM_BOT_TOKEN")
@@ -1344,10 +1371,10 @@ class IpHunter:
             LOGGER.warning(
                 "Telegram notification is enabled, but bot token or chat_id is missing."
             )
-            return
+            return False
 
         text = (
-            "YC IP Hunter found a target IP\n"
+            "YC IP Hunter found a target IP\n\n"
             f"IP: {result.ip}\n"
             f"Zone: {result.zone}\n"
             f"Cloud: {result.cloud_id}\n"
@@ -1363,8 +1390,25 @@ class IpHunter:
         try:
             http_json("POST", url, body=body, token=None, timeout=20)
             LOGGER.info("Telegram notification sent to chat %s.", chat_id)
+            return True
         except ApiError as exc:
             LOGGER.warning("Telegram notification failed: %s", exc)
+            return False
+        except Exception as exc:  # Notification must never break a reserved target IP.
+            LOGGER.warning("Telegram notification failed: %s", exc)
+            return False
+
+    def test_telegram_notification(self) -> bool:
+        return self.send_telegram_notification(
+            AttemptResult(
+                ip="203.0.113.10",
+                zone=str((self.config.get("zones") or [self.config.get("zone") or "ru-central1-a"])[0]),
+                address_id="telegram-test",
+                cloud_id="telegram-test",
+                folder_id="telegram-test",
+                dry_run=True,
+            )
+        )
 
     def track_cloud_address(self, cloud_id: str, address_id: str, ip: str) -> None:
         addresses_by_cloud = self.state.setdefault("addresses_by_cloud", {})
@@ -1953,6 +1997,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Required in live mode before the script may delete a cloud.",
     )
+    parser.add_argument(
+        "--test-telegram",
+        action="store_true",
+        help="Send one Telegram test message and exit.",
+    )
     return parser.parse_args(argv)
 
 
@@ -1968,6 +2017,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             dry_run_override=dry_run_override,
             yes_delete_cloud=bool(args.yes_delete_cloud),
         )
+        if args.test_telegram:
+            return 0 if hunter.test_telegram_notification() else 1
         return hunter.run()
     except KeyboardInterrupt:
         LOGGER.error("Interrupted.")

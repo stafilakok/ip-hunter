@@ -1,118 +1,193 @@
 # Yandex Cloud IP Hunter
 
-Local Python utility that reserves public static IPv4 addresses in Yandex Cloud
-and checks whether the allocated address belongs to configured IPs or CIDR
-pools. It supports two explicit rotation modes:
+Мужики, наколякал такое говно для вас: локальный скрипт, который крутит
+публичные IPv4 в Yandex Cloud, проверяет их по списку нужных IP/CIDR и
+останавливается, когда выпал подходящий адрес. Форкайте, играйте, чинитесь.
+Может, иногда буду обновлять, если опять не придется руками разгребать боль
+сообщества бедолаг.
 
-- `folder`: create a fresh folder inside one target cloud for each attempt.
-- `cloud`: create a fresh cloud for each attempt, bind billing, try an IP, then
-  submit async cloud deletion on miss.
+Скрипт запускается с ПК, ходит в Yandex Cloud API по ключу сервисного аккаунта
+и не требует `yc` CLI.
 
-This is destructive when live mode is enabled. Keep the service account in a
-stable cloud that this script will never delete.
+## Что умеет
 
-## What it uses
+- Резервировать случайные статические IPv4 в нужной зоне.
+- Проверять IP по `target_ips` и `target_cidrs`.
+- Сразу удалять неподходящие адреса.
+- Пробовать до `max_addresses_per_cloud` адресов в одном cloud.
+- При лимитах переходить к ротации cloud/folder, если включен hybrid/cloud mode.
+- Останавливать цикл на первом подходящем IP и оставлять адрес зарезервированным.
+- Писать состояние в `state.json`, логи в `run.log`.
+- Отправлять Telegram-уведомление при успехе.
 
-- IAM token endpoint: `POST https://iam.api.cloud.yandex.net/iam/v1/tokens`
-- VPC address endpoint: `POST https://vpc.api.cloud.yandex.net/vpc/v1/addresses`
-- Folder/cloud create/delete endpoints under Resource Manager
-- Billing bind endpoint:
-  `POST /billing/v1/billingAccounts/{billingAccountId}/billableObjectBindings`
-- Operation polling:
-  `GET https://operation.api.cloud.yandex.net/operations/{operationId}`
+## Важно про секреты
 
-## Requirements
+В репозиторий нельзя коммитить:
+
+- `config.json`
+- `sa-key.json`
+- `state.json`
+- `run.log`
+- любые `.env`, `*.key`, `*.pem`
+
+Они уже добавлены в `.gitignore`. Для публикации есть только
+`config.example.json` с плейсхолдерами.
+
+## Требования
 
 - Python 3.9+
-- For service account key auth:
+- Для авторизации через JSON-ключ сервисного аккаунта:
 
 ```powershell
 python -m pip install PyJWT cryptography
 ```
 
-No extra dependency is needed if you pass an IAM token through the `YC_IAM_TOKEN`
-environment variable.
+Если вместо ключа передаете готовый IAM token через переменную окружения
+`YC_IAM_TOKEN`, дополнительные зависимости не нужны.
 
-The service account needs enough permissions to:
+## Быстрый старт
 
-- folder mode: admin on the target cloud;
-- cloud mode: organization-level cloud create/delete rights and billing account
-  binding rights;
-- both modes: create folders and VPC public addresses.
+1. Скопируйте пример конфига:
 
-## Setup
+```powershell
+Copy-Item .\config.example.json .\config.json
+```
 
-1. Copy `config.example.json` to `config.json`.
-2. Fill in `organization_id`, `billing_account_id`, and either:
-   - `auth.service_account_key_file`, or
-   - `YC_IAM_TOKEN` environment variable.
-3. For folder mode, set `rotation_mode=folder` and `target_cloud_id`.
-4. For cloud mode, set `rotation_mode=cloud`, `organization_id`,
-   `billing_account_id`, and `service_cloud_id`.
-5. Keep `dry_run=true` for the first check.
+2. Заполните в `config.json`:
 
-Run a dry run:
+- `organization_id`
+- `billing_account_id`
+- `service_cloud_id`
+- `target_cloud_id`, если используете `rotation_mode=folder`
+- `auth.service_account_key_file`, обычно `sa-key.json`
+- `target_cidrs` или `target_ips`
+
+3. Первый запуск делайте в dry-run:
 
 ```powershell
 python .\yc_ip_hunter.py --config .\config.json --dry-run
 ```
 
-Run live in folder mode:
-
-```powershell
-python .\yc_ip_hunter.py --config .\config.json --run
-```
-
-Run live in cloud mode:
+4. Боевой запуск:
 
 ```powershell
 python .\yc_ip_hunter.py --config .\config.json --run --yes-delete-cloud
 ```
 
-For live cloud mode, the config must also contain:
+`--yes-delete-cloud` нужен только там, где скрипту разрешено удалять cloud.
+
+## Режимы
+
+### `rotation_mode: "folder"`
+
+Создает новые folder внутри одного существующего cloud. Самый спокойный режим:
+меньше шансов забить квоту cloud в организации.
+
+Нужно указать:
+
+```json
+{
+  "rotation_mode": "folder",
+  "target_cloud_id": "REPLACE_WITH_TARGET_CLOUD_ID_FOR_FOLDER_MODE"
+}
+```
+
+### `rotation_mode: "cloud"`
+
+Создает новый cloud, привязывает billing, пробует адреса, потом отправляет cloud
+на удаление. Работает жестче, но упирается в лимит количества cloud в
+организации. Async delete не освобождает квоту мгновенно.
+
+Нужно указать:
 
 ```json
 {
   "rotation_mode": "cloud",
   "allow_delete_cloud": true,
   "immediate_delete_cloud": true,
-  "max_parallel_clouds": 4,
-  "dry_run": false
+  "organization_id": "REPLACE_WITH_ORGANIZATION_ID",
+  "billing_account_id": "REPLACE_WITH_BILLING_ACCOUNT_ID",
+  "service_cloud_id": "REPLACE_WITH_SERVICE_CLOUD_ID"
 }
 ```
 
-## Candidate selection
+### `rotation_mode: "hybrid"`
 
-By default, `allocation_mode` is `random`: Yandex Cloud allocates any available
-public IPv4 in a zone, and the script checks whether that IP is in `target_ips`
-or `target_cidrs`. Unmatched addresses are deleted when
-`delete_unmatched_addresses=true`.
+Основной рабочий режим. Сначала крутит адреса внутри cloud, а при лимитах
+переходит к следующему cloud. Именно этот режим обычно нужен, если хочется
+поставить процесс на конвейер.
 
-There is also `allocation_mode=specific`, where the script asks the API for an
-exact address. In many accounts Yandex Cloud rejects this with `Permission denied
-to create specific address`; keep `random` unless your account is explicitly
-allowed to reserve exact public IPs.
+Полезные настройки:
 
-`max_iterations` limits how many rotation attempts are made. Set it to `0` to
-run continuously until a target IP is found. In cloud mode the script checks
-`max_parallel_clouds` before creating a new cloud and waits rather than
-hammering the API when the organization cloud quota is full.
+```json
+{
+  "rotation_mode": "hybrid",
+  "max_addresses_per_cloud": 9,
+  "max_parallel_clouds": 3,
+  "address_iteration_sleep_seconds": 2,
+  "cloud_iteration_sleep_seconds": 45,
+  "cloud_quota_wait_seconds": 120,
+  "max_iterations": 0
+}
+```
 
-In cloud mode, `max_addresses_per_cloud` controls how many public IPs are tried
-inside one cloud before the cloud is deleted. The working default is `9`, with
-`address_iteration_sleep_seconds` between address attempts to avoid the 10th
-allocation hitting the VPC creation limit.
+`max_iterations: 0` означает крутить до успеха.
 
-## State and logs
+## Telegram-уведомления
 
-- `state.json` stores current cloud/folder, attempts, and success result.
-- `run.log` stores all REST operations and decisions.
+В `config.json`:
 
-Delete `state.json` only when you intentionally want the script to forget its
-current cloud/folder and previous attempts.
+```json
+{
+  "notifications": {
+    "enabled": true,
+    "telegram": {
+      "enabled": true,
+      "bot_token_env": "TELEGRAM_BOT_TOKEN",
+      "chat_id": "REPLACE_WITH_CHAT_ID"
+    }
+  }
+}
+```
 
-## Notes
+Токен лучше хранить в переменной окружения:
 
-`deleteAfter=1970-01-01T00:00:00Z` plus non-waiting delete starts deletion
-immediately, but it does not guarantee instant quota release. Deleting clouds can
-still leave them counted until Yandex Cloud finishes cleanup.
+```powershell
+$env:TELEGRAM_BOT_TOKEN="123456:ABCDEF..."
+```
+
+Проверить, что бот реально пишет:
+
+```powershell
+python .\yc_ip_hunter.py --config .\config.json --test-telegram
+```
+
+Если сообщение не пришло, смотрите `run.log`: там будет причина, например
+неверный token, chat id или сетевой сбой.
+
+## Как понять, что IP найден
+
+В терминале и `run.log` появится строка:
+
+```text
+TARGET MATCH: allocated IP ... is in configured target ranges.
+```
+
+После этого скрипт:
+
+- сохраняет результат в `state.json`;
+- не удаляет найденный address;
+- отправляет Telegram-уведомление, если оно включено;
+- завершает работу с кодом `0`.
+
+## Тесты
+
+```powershell
+python -m unittest .\test_yc_ip_hunter.py
+```
+
+## Дисклеймер
+
+Это утилита для управления собственными облачными ресурсами и проверки
+выделенных вам адресов. За лимиты, квоты, биллинг, удаленные cloud и прочие
+радости взрослой жизни отвечает тот, кто нажал Enter.

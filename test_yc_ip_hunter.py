@@ -233,6 +233,7 @@ class IterationTests(unittest.TestCase):
         text = MODULE_PATH.read_text(encoding="utf-8")
         self.assertIn("notify_success", text)
         self.assertIn("TELEGRAM_BOT_TOKEN", text)
+        self.assertIn("--test-telegram", text)
 
 
 class StateTrackingTests(unittest.TestCase):
@@ -353,6 +354,63 @@ class StateTrackingTests(unittest.TestCase):
 
         self.assertEqual(called, ["198.51.100.10"])
         self.assertEqual(hunter.state["success"]["ip"], "198.51.100.10")
+
+    def test_telegram_enabled_inside_disabled_parent_still_sends(self):
+        hunter = object.__new__(yc.IpHunter)
+        hunter.config = {
+            "notifications": {
+                "enabled": False,
+                "telegram": {
+                    "enabled": True,
+                    "bot_token": "token",
+                    "chat_id": "chat",
+                },
+            }
+        }
+        calls = []
+        original_http_json = yc.http_json
+        yc.http_json = lambda method, url, body, token, timeout=60: calls.append(
+            (method, url, body, token, timeout)
+        ) or {"ok": True}
+        try:
+            hunter.notify_success(
+                yc.AttemptResult(
+                    ip="198.51.100.10",
+                    zone="ru-central1-a",
+                    address_id="addr-1",
+                    cloud_id="cloud-1",
+                    folder_id="folder-1",
+                )
+            )
+        finally:
+            yc.http_json = original_http_json
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "POST")
+        self.assertIn("198.51.100.10", calls[0][2]["text"])
+
+    def test_telegram_test_message_uses_fake_attempt_result(self):
+        hunter = object.__new__(yc.IpHunter)
+        hunter.config = {
+            "zone": "ru-central1-a",
+            "notifications": {
+                "telegram": {
+                    "enabled": True,
+                    "bot_token": "token",
+                    "chat_id": "chat",
+                },
+            },
+        }
+        calls = []
+        original_http_json = yc.http_json
+        yc.http_json = lambda method, url, body, token, timeout=60: calls.append(body) or {"ok": True}
+        try:
+            self.assertTrue(hunter.test_telegram_notification())
+        finally:
+            yc.http_json = original_http_json
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn("telegram-test", calls[0]["text"])
 
 
 if __name__ == "__main__":
