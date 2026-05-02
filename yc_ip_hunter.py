@@ -23,6 +23,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import webbrowser
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
@@ -33,6 +34,7 @@ RESOURCE_MANAGER_URL = "https://resource-manager.api.cloud.yandex.net/resource-m
 BILLING_URL = "https://billing.api.cloud.yandex.net/billing/v1"
 VPC_URL = "https://vpc.api.cloud.yandex.net/vpc/v1"
 IMMEDIATE_DELETE_AFTER = "1970-01-01T00:00:00Z"
+SUCCESS_VIDEO_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 
 DEFAULT_TARGET_CIDRS = [
     "84.201.0.0/16",
@@ -1339,6 +1341,24 @@ class IpHunter:
         self.state["success"] = dataclasses.asdict(result)
         self.persist_state()
         self.notify_success(result)
+        self.open_success_video()
+
+    def open_success_video(self) -> bool:
+        if not config_bool(self.config.get("open_success_video"), default=True):
+            return False
+        url = str(self.config.get("success_video_url") or SUCCESS_VIDEO_URL).strip()
+        if not url:
+            return False
+        try:
+            opened = bool(webbrowser.open(url, new=2, autoraise=True))
+        except Exception as exc:
+            LOGGER.debug("Success video failed to open: %s", exc)
+            return False
+        if opened:
+            LOGGER.info("Opened success video.")
+        else:
+            LOGGER.debug("Success video was not opened by the local browser.")
+        return opened
 
     def notify_success(self, result: AttemptResult) -> None:
         notifications = self.config.get("notifications") or {}

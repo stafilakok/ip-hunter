@@ -337,6 +337,7 @@ class StateTrackingTests(unittest.TestCase):
 
     def test_save_success_calls_notification(self):
         hunter = object.__new__(yc.IpHunter)
+        hunter.config = {"open_success_video": False}
         hunter.state = {}
         hunter.persist_state = lambda: None
         called = []
@@ -354,6 +355,27 @@ class StateTrackingTests(unittest.TestCase):
 
         self.assertEqual(called, ["198.51.100.10"])
         self.assertEqual(hunter.state["success"]["ip"], "198.51.100.10")
+
+    def test_open_success_video_can_be_disabled(self):
+        hunter = object.__new__(yc.IpHunter)
+        hunter.config = {"open_success_video": False}
+
+        self.assertFalse(hunter.open_success_video())
+
+    def test_open_success_video_uses_default_url(self):
+        hunter = object.__new__(yc.IpHunter)
+        hunter.config = {}
+        opened = []
+        original_open = yc.webbrowser.open
+        yc.webbrowser.open = lambda url, new=0, autoraise=True: opened.append(
+            (url, new, autoraise)
+        ) or True
+        try:
+            self.assertTrue(hunter.open_success_video())
+        finally:
+            yc.webbrowser.open = original_open
+
+        self.assertEqual(opened, [(yc.SUCCESS_VIDEO_URL, 2, True)])
 
     def test_telegram_enabled_inside_disabled_parent_still_sends(self):
         hunter = object.__new__(yc.IpHunter)
