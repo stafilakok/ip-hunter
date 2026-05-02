@@ -1,0 +1,16 @@
+config.json
+config.*.json
+!config.example.json
+sa-key.json
+*-key.json
+*.pem
+*.key
+.env
+.env.*
+state.json
+state.json.tmp
+run.log
+*.log
+__pycache__/
+*.pyc
+.pytest_cache/
