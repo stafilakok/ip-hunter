@@ -34,7 +34,6 @@ OPERATION_URL = "https://operation.api.cloud.yandex.net/operations/{operation_id
 RESOURCE_MANAGER_URL = "https://resource-manager.api.cloud.yandex.net/resource-manager/v1"
 BILLING_URL = "https://billing.api.cloud.yandex.net/billing/v1"
 VPC_URL = "https://vpc.api.cloud.yandex.net/vpc/v1"
-COMPUTE_URL = "https://compute.api.cloud.yandex.net/compute/v1"
 IMMEDIATE_DELETE_AFTER = "1970-01-01T00:00:00Z"
 SUCCESS_VIDEO_URL = "https://www.youtube.com/watch?v=tiCIjTNARX8&list=PLCZl9PrJVBkSJGJi3zpDkbxy8X-BeUQvK"
 
@@ -479,50 +478,6 @@ class YandexCloudClient:
             page_token = str(response.get("nextPageToken") or "")
             if not page_token:
                 return clouds
-
-    def list_folders(self, cloud_id: str) -> List[Dict[str, Any]]:
-        folders: List[Dict[str, Any]] = []
-        page_token = ""
-        while True:
-            query = {"cloudId": cloud_id, "pageSize": "1000"}
-            if page_token:
-                query["pageToken"] = page_token
-            url = f"{RESOURCE_MANAGER_URL}/folders?{urllib.parse.urlencode(query)}"
-            response = self.request("GET", url, body=None, operation_hint="folder-list")
-            folders.extend(response.get("folders") or [])
-            page_token = str(response.get("nextPageToken") or "")
-            if not page_token:
-                return folders
-
-    def list_collection(
-        self, base_url: str, collection_name: str, folder_id: str
-    ) -> List[Dict[str, Any]]:
-        resources: List[Dict[str, Any]] = []
-        page_token = ""
-        while True:
-            query = {"folderId": folder_id, "pageSize": "1000"}
-            if page_token:
-                query["pageToken"] = page_token
-            url = f"{base_url}?{urllib.parse.urlencode(query)}"
-            response = self.request("GET", url, body=None, operation_hint=f"{collection_name}-list")
-            resources.extend(response.get(collection_name) or [])
-            page_token = str(response.get("nextPageToken") or "")
-            if not page_token:
-                return resources
-
-    def delete_resource(
-        self, base_url: str, resource_id: str, operation_hint: str, wait: bool = False
-    ) -> Optional[Dict[str, Any]]:
-        quoted = urllib.parse.quote(resource_id, safe="")
-        operation = self.request(
-            "DELETE",
-            f"{base_url}/{quoted}",
-            body=None,
-            operation_hint=operation_hint,
-        )
-        if wait:
-            self.wait_operation(operation)
-        return operation
 
     def get_cloud(self, cloud_id: str) -> Dict[str, Any]:
         quoted = urllib.parse.quote(cloud_id, safe="")
@@ -1595,19 +1550,13 @@ class IpHunter:
         if not cloud_id:
             return
         self.ensure_managed_cloud_delete_allowed(cloud_id)
-        self.cleanup_cloud_before_delete(cloud_id)
+        self.cleanup_cloud_addresses(cloud_id)
         LOGGER.warning("Submitting async delete for cloud %s.", cloud_id)
         self.client.delete_cloud(cloud_id, immediate=True, wait=False)
         self.state.setdefault("deleting_clouds", []).append(
             {"cloud_id": cloud_id, "at": utc_now_rfc3339()}
         )
         self.persist_state()
-
-    def cleanup_cloud_before_delete(self, cloud_id: str) -> None:
-        if config_bool(self.config.get("deep_cleanup_before_cloud_delete"), default=True):
-            self.deep_cleanup_cloud(cloud_id)
-            return
-        self.cleanup_cloud_addresses(cloud_id)
 
     def cleanup_cloud_addresses(self, cloud_id: str) -> None:
         addresses_by_cloud = self.state.get("addresses_by_cloud") or {}
@@ -1662,86 +1611,6 @@ class IpHunter:
         )
         self.persist_state()
         self.sleep_backoff(cleanup_sleep)
-
-    def deep_cleanup_cloud(self, cloud_id: str) -> None:
-        LOGGER.info("Deep cleanup before cloud delete for %s.", cloud_id)
-        self.cleanup_cloud_addresses(cloud_id)
-        if self.dry_run:
-            return
-        try:
-            folders = self.client.list_folders(cloud_id)
-        except ApiError as exc:
-            LOGGER.warning("Could not list folders in cloud %s before delete: %s", cloud_id, exc)
-            return
-
-        for folder in folders:
-            folder_id = str(folder.get("id") or "")
-            if folder_id:
-                self.deep_cleanup_folder(folder_id)
-
-        settle_seconds = float(self.config.get("deep_cleanup_settle_seconds", 2))
-        if settle_seconds > 0:
-            self.sleep_backoff(settle_seconds)
-
-    def deep_cleanup_folder(self, folder_id: str) -> None:
-        LOGGER.info("Deep cleanup folder %s before cloud delete.", folder_id)
-        cleanup_plan = [
-            ("instances", f"{COMPUTE_URL}/instances", "delete-instance"),
-            ("addresses", f"{VPC_URL}/addresses", "delete-address"),
-            ("disks", f"{COMPUTE_URL}/disks", "delete-disk"),
-            ("snapshots", f"{COMPUTE_URL}/snapshots", "delete-snapshot"),
-            ("images", f"{COMPUTE_URL}/images", "delete-image"),
-            ("subnets", f"{VPC_URL}/subnets", "delete-subnet"),
-            ("routeTables", f"{VPC_URL}/routeTables", "delete-route-table"),
-            ("securityGroups", f"{VPC_URL}/securityGroups", "delete-security-group"),
-            ("networks", f"{VPC_URL}/networks", "delete-network"),
-        ]
-        for collection_name, base_url, operation_hint in cleanup_plan:
-            self.deep_cleanup_collection(folder_id, collection_name, base_url, operation_hint)
-
-    def deep_cleanup_collection(
-        self,
-        folder_id: str,
-        collection_name: str,
-        base_url: str,
-        operation_hint: str,
-    ) -> None:
-        try:
-            resources = self.client.list_collection(base_url, collection_name, folder_id)
-        except ApiError as exc:
-            LOGGER.warning(
-                "Could not list %s in folder %s before delete: %s",
-                collection_name,
-                folder_id,
-                exc,
-            )
-            return
-
-        for resource in resources:
-            resource_id = str(resource.get("id") or "")
-            if not resource_id:
-                continue
-            try:
-                LOGGER.info("Submitting async delete for %s %s.", collection_name, resource_id)
-                self.client.delete_resource(base_url, resource_id, operation_hint, wait=False)
-                if collection_name == "addresses":
-                    self.mark_cloud_address_delete_submitted(resource_id)
-            except ApiError as exc:
-                text = exc.text()
-                if exc.status == 404 or "not found" in text:
-                    continue
-                if (
-                    collection_name == "securityGroups"
-                    and ("default" in text or "cannot delete" in text)
-                ):
-                    LOGGER.debug("Skipping undeletable security group %s: %s", resource_id, exc)
-                    continue
-                LOGGER.warning(
-                    "Could not delete %s %s before cloud delete: %s",
-                    collection_name,
-                    resource_id,
-                    exc,
-                )
 
     def ensure_managed_cloud_delete_allowed(self, cloud_id: str) -> None:
         service_cloud_id = str(self.config.get("service_cloud_id") or "")
@@ -1992,7 +1861,6 @@ class IpHunter:
         immediate = bool(self.config.get("immediate_delete_cloud", True))
         LOGGER.warning("Deleting cloud %s (immediate=%s).", old_cloud_id, immediate)
         try:
-            self.cleanup_cloud_before_delete(str(old_cloud_id))
             self.client.delete_cloud(str(old_cloud_id), immediate=immediate, wait=False)
             LOGGER.info(
                 "Delete operation submitted for cloud %s; continuing without waiting.",
