@@ -26,7 +26,8 @@ import urllib.parse
 import urllib.request
 import webbrowser
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+from collections import deque
+from typing import Any, Deque, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 
 IAM_TOKEN_URL = "https://iam.api.cloud.yandex.net/iam/v1/tokens"
@@ -399,7 +400,7 @@ class YandexCloudClient:
         body: Optional[Dict[str, Any]] = None,
         operation_hint: str = "operation",
     ) -> Dict[str, Any]:
-        if self.dry_run:
+        if self.dry_run and method != "GET":
             LOGGER.info("[dry-run] %s %s", method, url)
             if body is not None:
                 LOGGER.info("[dry-run] body=%s", json.dumps(body, ensure_ascii=True))
@@ -408,6 +409,8 @@ class YandexCloudClient:
                 "done": True,
                 "response": {"id": f"dry-{operation_hint}"},
             }
+        if self.dry_run:
+            LOGGER.info("[dry-run] GET %s", url)
         return http_json(method, url, body=body, token=self.token_provider.get())
 
     def wait_operation(self, operation: Dict[str, Any]) -> Dict[str, Any]:
@@ -478,6 +481,34 @@ class YandexCloudClient:
             page_token = str(response.get("nextPageToken") or "")
             if not page_token:
                 return clouds
+
+    def list_folders(self, cloud_id: str) -> List[Dict[str, Any]]:
+        folders: List[Dict[str, Any]] = []
+        page_token = ""
+        while True:
+            query = {"cloudId": cloud_id, "pageSize": "1000"}
+            if page_token:
+                query["pageToken"] = page_token
+            url = f"{RESOURCE_MANAGER_URL}/folders?{urllib.parse.urlencode(query)}"
+            response = self.request("GET", url, body=None, operation_hint="folder-list")
+            folders.extend(response.get("folders") or [])
+            page_token = str(response.get("nextPageToken") or "")
+            if not page_token:
+                return folders
+
+    def list_addresses(self, folder_id: str) -> List[Dict[str, Any]]:
+        addresses: List[Dict[str, Any]] = []
+        page_token = ""
+        while True:
+            query = {"folderId": folder_id, "pageSize": "1000"}
+            if page_token:
+                query["pageToken"] = page_token
+            url = f"{VPC_URL}/addresses?{urllib.parse.urlencode(query)}"
+            response = self.request("GET", url, body=None, operation_hint="address-list")
+            addresses.extend(response.get("addresses") or [])
+            page_token = str(response.get("nextPageToken") or "")
+            if not page_token:
+                return addresses
 
     def get_cloud(self, cloud_id: str) -> Dict[str, Any]:
         quoted = urllib.parse.quote(cloud_id, safe="")
@@ -824,6 +855,7 @@ class IpHunter:
         if dry_run_override is not None:
             self.dry_run = dry_run_override
         self.yes_delete_cloud = yes_delete_cloud
+        self._protected_clouds: Set[str] = set()
 
         self.state_path = resolve_path(
             self.config_dir, str(config.get("state_file") or "state.json")
@@ -948,6 +980,9 @@ class IpHunter:
                 result = self.allocate_and_classify(target_cloud_id, folder_id, iteration)
             except RateLimitHit as exc:
                 LOGGER.warning("Rate limit hit: %s", exc)
+                address_id = str(self.state.get("last_address_id") or "")
+                if address_id:
+                    self.submit_address_delete(address_id)
                 if folder_id:
                     self.submit_folder_delete(folder_id)
                 self.sleep_backoff(backoff)
@@ -969,6 +1004,9 @@ class IpHunter:
                 )
                 return 0
 
+            address_id = str(self.state.get("last_address_id") or "")
+            if address_id:
+                self.submit_address_delete(address_id)
             self.submit_folder_delete(folder_id)
             self.sleep_backoff(float(self.config.get("iteration_sleep_seconds", 10)))
             backoff = base_backoff
@@ -985,6 +1023,8 @@ class IpHunter:
         for iteration in self.iteration_numbers(max_iterations):
             LOGGER.info("Cloud rotation iteration %s/%s.", iteration, self.iteration_limit_label(max_iterations))
             if not self.wait_for_cloud_slot():
+                if bool(self.config.get("continuous", False)):
+                    continue
                 return 2
 
             cloud_id = ""
@@ -1034,7 +1074,17 @@ class IpHunter:
         base_backoff = float(self.config.get("cooldown_seconds", 15))
         max_backoff = float(self.config.get("backoff_max_seconds", 240))
         backoff = base_backoff
-        use_existing_scope = True
+
+        if bool(self.config.get("startup_scan_on_start", True)):
+            existing_cloud_ids = self.startup_scan()
+        else:
+            existing_cloud_ids = []
+
+        # Queue of pre-existing clouds to work through before creating new ones.
+        # Protected clouds (have target IPs) are included so we can keep hunting
+        # in them; submit_cloud_delete will refuse to delete them if quota is hit.
+        existing_queue: Deque[str] = deque(existing_cloud_ids)
+        deferred = 0
 
         for iteration in self.iteration_numbers(max_iterations):
             LOGGER.info(
@@ -1046,12 +1096,29 @@ class IpHunter:
             folder_id = ""
             managed_cloud = False
             try:
-                if use_existing_scope:
-                    cloud_id, folder_id = self.ensure_hybrid_address_scope(iteration)
-                    managed_cloud = self.can_delete_hybrid_cloud(cloud_id)
-                    use_existing_scope = False
+                if existing_queue:
+                    cloud_id = existing_queue.popleft()
+                    LOGGER.info("Hybrid mode reusing existing cloud %s.", cloud_id)
+                    try:
+                        folder_id = self.create_folder_in_cloud(cloud_id, iteration)
+                        deferred = 0
+                    except ApiError as exc:
+                        if "currently being deleted" in exc.text() or "scheduled for deletion" in exc.text():
+                            if deferred >= len(existing_queue):
+                                self.sleep_backoff(float(self.config.get("cloud_iteration_sleep_seconds", 45)))
+                            deferred += 1
+                            LOGGER.info("Cloud %s has pending folder deletions; trying next cloud.", cloud_id)
+                            existing_queue.append(cloud_id)
+                            continue
+                        if exc.status == 403:
+                            LOGGER.warning("No permission on existing cloud %s (SA role grant may have been interrupted); skipping.", cloud_id)
+                            continue
+                        raise
+                    managed_cloud = cloud_id not in self._protected_clouds
                 else:
                     if not self.wait_for_cloud_slot():
+                        if bool(self.config.get("continuous", False)):
+                            continue
                         return 2
                     cloud_id, folder_id = self.create_cloud_cycle(iteration)
                     managed_cloud = True
@@ -1065,7 +1132,12 @@ class IpHunter:
                         result.folder_id,
                         result.address_id,
                     )
-                    return 0
+                    if not bool(self.config.get("continuous", False)):
+                        return 0
+                    self._protected_clouds.add(cloud_id)
+                    LOGGER.info("Continuous mode: keeping cloud %s and hunting for next target IP.", cloud_id)
+                    backoff = base_backoff
+                    continue
 
                 LOGGER.warning(
                     "Address rotation in cloud %s hit a limit; rotating cloud.",
@@ -1114,7 +1186,12 @@ class IpHunter:
         if not cloud_id:
             LOGGER.info("Hybrid mode starts by creating a disposable hunting cloud.")
             if not self.wait_for_cloud_slot():
-                raise QuotaHit("No cloud slot is available for hybrid mode.")
+                if bool(self.config.get("continuous", False)):
+                    while not self.wait_for_cloud_slot():
+                        LOGGER.info("Cloud slot still full; retrying wait.")
+                else:
+                    raise QuotaHit("No cloud slot is available for hybrid mode.")
+
             return self.create_cloud_cycle(iteration)
 
         explicit_folder_id = str(self.config.get("folder_id") or "")
@@ -1309,6 +1386,13 @@ class IpHunter:
         folder = self.client.create_folder(cloud_id, folder_name, labels)
         folder_id = str(folder["id"])
         LOGGER.info("Created folder %s (%s).", folder_name, folder_id)
+        return folder_id
+
+    def create_folder_in_cloud(self, cloud_id: str, iteration: int) -> str:
+        """Create a fresh hunting folder inside an existing cloud and grant SA access."""
+        folder_id = self.create_named_folder(cloud_id, self.roll_name("folder", iteration))
+        self.grant_self_access_to_folder(folder_id)
+        self.sleep_after_iam_grants()
         return folder_id
 
     def create_cloud_cycle(self, iteration: int) -> Tuple[str, str]:
@@ -1544,10 +1628,20 @@ class IpHunter:
         if not folder_id:
             return
         LOGGER.warning("Submitting async delete for folder %s.", folder_id)
-        self.client.delete_folder(folder_id, immediate=True, wait=False)
+        try:
+            self.client.delete_folder(folder_id, immediate=True, wait=False)
+        except ApiError as exc:
+            text = exc.text()
+            if "scheduled for deletion" in text or "currently being deleted" in text or exc.status == 404:
+                LOGGER.info("Folder %s is already being deleted; skipping.", folder_id)
+                return
+            raise
 
     def submit_cloud_delete(self, cloud_id: str) -> None:
         if not cloud_id:
+            return
+        if cloud_id in self._protected_clouds:
+            LOGGER.info("Cloud %s has target IPs; skipping deletion.", cloud_id)
             return
         self.ensure_managed_cloud_delete_allowed(cloud_id)
         self.cleanup_cloud_addresses(cloud_id)
@@ -1659,6 +1753,89 @@ class IpHunter:
                 continue
             count += 1
         return count
+
+    def startup_scan(self) -> List[str]:
+        """Scan all existing non-service clouds on startup.
+
+        For each cloud/folder/address found:
+        - If the address matches target_cidrs: mark cloud as protected, track the address.
+        - If not: delete the address. If the folder becomes empty, delete the folder.
+
+        Returns list of existing cloud IDs (in discovery order) for the rotation queue.
+        """
+        organization_id = str(self.config.get("organization_id") or "")
+        if not organization_id:
+            return []
+        service_cloud_id = str(self.config.get("service_cloud_id") or "")
+        target_ips = self.config.get("target_ips") or []
+        target_networks = build_target_networks(self.config.get("target_cidrs") or DEFAULT_TARGET_CIDRS)
+
+        try:
+            all_clouds = self.client.list_clouds(organization_id)
+        except ApiError as exc:
+            LOGGER.warning("Startup scan: could not list clouds: %s. Skipping scan.", exc.message)
+            return []
+
+        cloud_ids: List[str] = []
+        for cloud in all_clouds:
+            cloud_id = str(cloud.get("id") or "")
+            if not cloud_id:
+                continue
+            if service_cloud_id and cloud_id == service_cloud_id:
+                continue
+            cloud_ids.append(cloud_id)
+
+        LOGGER.info("Startup scan: found %s non-service cloud(s) to inspect.", len(cloud_ids))
+
+        for cloud_id in cloud_ids:
+            try:
+                folders = self.client.list_folders(cloud_id)
+            except ApiError as exc:
+                LOGGER.warning("Startup scan: could not list folders in cloud %s: %s. Skipping.", cloud_id, exc.message)
+                continue
+
+            for folder in folders:
+                folder_id = str(folder.get("id") or "")
+                if not folder_id:
+                    continue
+                try:
+                    addresses = self.client.list_addresses(folder_id)
+                except ApiError as exc:
+                    LOGGER.warning("Startup scan: could not list addresses in folder %s: %s. Skipping.", folder_id, exc.message)
+                    continue
+
+                folder_has_target = False
+                for addr in addresses:
+                    address_id = str(addr.get("id") or "")
+                    allocated = (
+                        addr.get("externalIpv4Address", {}).get("address")
+                        or addr.get("external_ipv4_address", {}).get("address")
+                    )
+                    if not address_id or not allocated:
+                        continue
+                    ip = str(allocated)
+                    if ip_matches_targets(ip, target_ips, target_networks):
+                        LOGGER.info(
+                            "Startup scan: target IP %s found in cloud %s folder %s — protecting cloud.",
+                            ip, cloud_id, folder_id,
+                        )
+                        self.track_cloud_address(cloud_id, address_id, ip)
+                        self._protected_clouds.add(cloud_id)
+                        folder_has_target = True
+                    else:
+                        LOGGER.info("Startup scan: deleting non-target address %s (%s) in folder %s.", address_id, ip, folder_id)
+                        self.submit_address_delete(address_id)
+
+                if not folder_has_target:
+                    LOGGER.info("Startup scan: deleting empty/non-target folder %s in cloud %s.", folder_id, cloud_id)
+                    self.submit_folder_delete(folder_id)
+
+        if self._protected_clouds:
+            LOGGER.info("Startup scan complete. Protected clouds (have target IPs): %s.", list(self._protected_clouds))
+        else:
+            LOGGER.info("Startup scan complete. No target IPs found in existing clouds.")
+
+        return cloud_ids
 
     def step_error(self, step: str, exc: ApiError) -> ConfigError:
         if exc.status == 403:
