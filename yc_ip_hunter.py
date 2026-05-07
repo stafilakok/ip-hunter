@@ -1822,6 +1822,22 @@ class IpHunter:
                         self.track_cloud_address(cloud_id, address_id, ip)
                         self._protected_clouds.add(cloud_id)
                         folder_has_target = True
+                        zone = str(
+                            addr.get("externalIpv4Address", {}).get("zoneId")
+                            or addr.get("external_ipv4_address", {}).get("zoneId")
+                            or addr.get("external_ipv4_address", {}).get("zone_id")
+                            or ""
+                        )
+                        self.notify_success(
+                            AttemptResult(
+                                ip=ip,
+                                zone=zone,
+                                address_id=address_id,
+                                cloud_id=cloud_id,
+                                folder_id=folder_id,
+                                dry_run=self.dry_run,
+                            )
+                        )
                     else:
                         LOGGER.info("Startup scan: deleting non-target address %s (%s) in folder %s.", address_id, ip, folder_id)
                         self.submit_address_delete(address_id)
